@@ -18,6 +18,8 @@
     </a>
     {% if state.initialized %}
     <nav class="topnav">
+      <a class="pill" href="{{ url_for('dashboard') }}">底表上传</a>
+      <a class="pill" href="{{ url_for('classify') }}">分类月表</a>
       <span class="pill">当前待封月 <b>{{ state.current_pending_month }}</b></span>
       {% if state.sealed_months %}
       <span class="pill muted">已封 {{ state.sealed_months|length }} 个月</span>

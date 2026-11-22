@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}分类月表 · 环卫入仓台账{% endblock %}
+{% block content %}
+<section class="grid">
+  <div class="panel tall">
+    <div class="panel-head">
+      <div>
+        <h1>分类月表</h1>
+        <p class="sub">按入账月份范围查询，逐月列出各类垃圾的当月净重与旧月调整。</p>
+      </div>
+    </div>
+
+    <form method="get" action="{{ url_for('classify') }}" class="range-form">
+      <label class="field">
+        <span>起始月份</span>
+        <input type="month" name="start" value="{{ start }}" required>
+      </label>
+      <label class="field">
+        <span>截止月份</span>
+        <input type="month" name="end" value="{{ end }}" required>
+      </label>
+      <button class="btn primary" type="submit">查询分类月表</button>
+    </form>
+
+    {% if message %}
+      <p class="result bad">{{ message }}</p>
+    {% endif %}
+
+    {% if report %}
+      <p class="sub">
+        查询区间 {{ report.start_month }} 至 {{ report.end_month }} ·
+        整次结果取自同一份账目与分拣资料快照
+      </p>
+
+      {% for month in report.months %}
+      <h2 class="month-heading">{{ month.month }}</h2>
+      {% if month.categories %}
+      <div class="table-wrap">
+        <table class="ledger">
+          <thead>
+            <tr>
+              <th scope="col">垃圾类别</th>
+              <th scope="col" class="num">当月净重<span>kg</span></th>
+              <th scope="col" class="num">旧月调整<span>kg</span></th>
+              <th scope="col" class="num">合计<span>kg</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in month.categories %}
+            <tr {% if row.reserved %}class="reserved-row"{% endif %}>
+              <th scope="row">{{ row.category }}{% if row.reserved %}（缺分拣资料）{% endif %}</th>
+              <td class="num">{{ row.current_grams|kg }}</td>
+              <td class="num {{ 'neg' if row.adjustment_grams < 0 else ('pos' if row.adjustment_grams > 0 else '') }}">
+                {{ row.adjustment_grams|kg }}
+              </td>
+              <td class="num strong">{{ row.total_grams|kg }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+          <tfoot>
+            <tr>
+              <th scope="row">合计</th>
+              <td class="num">{{ month.totals.current_grams|kg }}</td>
+              <td class="num">{{ month.totals.adjustment_grams|kg }}</td>
+              <td class="num strong">{{ month.totals.total_grams|kg }}</td>
+            </tr>
+            <tr class="check-row">
+              <th scope="row">原底表合计核对</th>
+              <td class="num">{{ month.bottom_totals.current_grams|kg }}</td>
+              <td class="num">{{ month.bottom_totals.adjustment_grams|kg }}</td>
+              <td class="num">{{ month.bottom_totals.total_grams|kg }}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+      {% if not month.matches_bottom %}
+      <p class="result bad">{{ month.month }} 分类合计与原底表不符，请核对分拣资料。</p>
+      {% endif %}
+      {% else %}
+      <p class="empty small">{{ month.month }} 没有入账记录。</p>
+      {% endif %}
+      {% endfor %}
+
+      <h2 class="month-heading spaced">待补分拣资料</h2>
+      {% if report.pending %}
+      <p class="sub">以下入账（按有效修订号）还没有分拣资料，其重量暂计入「未分类」。</p>
+      <div class="table-wrap">
+        <table class="ledger compact">
+          <thead>
+            <tr>
+              <th scope="col">单号</th>
+              <th scope="col" class="num">入账修订号</th>
+              <th scope="col">清运月</th>
+              <th scope="col" class="num">入账净重<span>kg</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in report.pending %}
+            <tr>
+              <th scope="row">{{ item.ticket_no }}</th>
+              <td class="num">{{ item.revision }}</td>
+              <td>{{ item.collection_month }}</td>
+              <td class="num">{{ item.net_grams|kg }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="empty small">查询区间内没有待补分拣的入账。</p>
+      {% endif %}
+    {% endif %}
+  </div>
+
+  <aside class="panel">
+    <h2>换交分拣资料</h2>
+    <form id="sorting-form" class="upload" enctype="multipart/form-data">
+      <label class="field">
+        <span>分拣 CSV 文件</span>
+        <input type="file" name="file" accept=".csv,text/csv" required>
+        <small>
+          列：单号、修订号、类别、克重（非负整数克）。
+          <a href="{{ url_for('sorting_template') }}">下载分拣模板</a>
+        </small>
+      </label>
+      <div class="upload-target">
+        每笔每类只填一行，各类克重之和须等于该笔入账净重。
+        <small>整份替换所列各笔的分类；校验或保存失败时保留原分类。</small>
+      </div>
+      <button class="btn primary" type="submit">上传并校验分拣资料</button>
+    </form>
+    <div id="sorting-result" class="result" hidden></div>
+
+    <h2 class="spaced">分拣规则</h2>
+    <ul class="notes-list">
+      <li>分拣单可晚于地磅单到仓：缺资料的重量计入「未分类」。</li>
+      <li>修订号必须是该单号实际入账的修订号；只推进修订号的版本不记账。</li>
+      <li>冲回按被冲回那笔入账的分类扣减；补交或更正后，原入账与对应冲回同时改归。</li>
+      <li>已封底表照常下载，分类调整不影响封存快照。</li>
+    </ul>
+
+    {% if state.sorting_batches %}
+    <h2 class="spaced">最近换交批次</h2>
+    <ul class="batch-list">
+      {% for batch in state.sorting_batches %}
+      <li>
+        <span class="batch-id">#{{ batch.id }}</span>
+        <span class="batch-file" title="{{ batch.filename }}">{{ batch.filename }}</span>
+        <span>{{ batch.ticket_count }} 笔 · {{ batch.row_count }} 行</span>
+        <span class="muted">{{ batch.uploaded_at|time }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </aside>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='app.js') }}" defer></script>
+{% endblock %}

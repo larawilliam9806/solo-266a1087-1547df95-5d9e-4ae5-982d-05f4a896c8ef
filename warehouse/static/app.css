@@ -294,3 +294,35 @@ input[type="file"]:focus-visible,
   color: var(--muted);
   font-size: 12px;
 }
+
+.range-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+.range-form .field { flex: 0 1 200px; }
+
+.month-heading {
+  margin: 22px 0 10px;
+  font-size: 16px;
+  letter-spacing: .01em;
+  padding-left: 10px;
+  border-left: 3px solid var(--accent);
+}
+
+.ledger .reserved-row th { color: var(--neg); font-style: italic; }
+.ledger tfoot tr.check-row th,
+.ledger tfoot tr.check-row td {
+  background: #f1ede2;
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.notes-list { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
+.notes-list li { margin: 6px 0; }
+
+.topnav a.pill { text-decoration: none; color: var(--ink); }
+.topnav a.pill:hover { border-color: var(--accent); color: var(--accent); }

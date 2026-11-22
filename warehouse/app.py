@@ -130,6 +130,49 @@ def create_app(test_config: dict | None = None) -> Flask:
         )
         return jsonify({"ok": True, **result})
 
+    @app.post("/api/sorting")
+    def upload_sorting():
+        check_csrf()
+        upload_file = request.files.get("file")
+        if upload_file is None or not upload_file.filename:
+            raise ValidationError("请选择要上传的分拣 CSV 文件")
+        result = service.upload_sorting(
+            db_path,
+            upload_file.filename,
+            upload_file.read(),
+        )
+        return jsonify({"ok": True, **result})
+
+    @app.get("/api/classification")
+    def api_classification():
+        start = request.args.get("start")
+        end = request.args.get("end")
+        if not start or not end:
+            raise ValidationError("请提供起始月份 start 与截止月份 end")
+        return jsonify(service.classification_view(db_path, start, end))
+
+    @app.get("/classify")
+    def classify():
+        state = service.state_view(db_path)
+        if not state["initialized"]:
+            return render_template("setup.html", state=state)
+        start = request.args.get("start") or state["current_pending_month"]
+        end = request.args.get("end") or state["current_pending_month"]
+        try:
+            report = service.classification_view(db_path, start, end)
+            message = None
+        except LedgerError as exc:
+            report = None
+            message = exc.message
+        return render_template(
+            "classify.html",
+            state=state,
+            report=report,
+            start=start,
+            end=end,
+            message=message,
+        )
+
     @app.post("/seal")
     def seal():
         check_csrf()
@@ -182,6 +225,20 @@ def create_app(test_config: dict | None = None) -> Flask:
             download_name="入仓模板.csv",
         )
 
+    @app.get("/sorting-template.csv")
+    def sorting_template():
+        data = (
+            "单号,修订号,类别,克重\n"
+            "WB-2026-0001,1,厨余垃圾,780500\n"
+            "WB-2026-0001,1,其他垃圾,500000\n"
+        ).encode("utf-8-sig")
+        return send_file(
+            io.BytesIO(data),
+            mimetype="text/csv; charset=utf-8",
+            as_attachment=True,
+            download_name="分拣模板.csv",
+        )
+
     @app.get("/api/state")
     def api_state():
         return jsonify(service.state_view(db_path))
@@ -214,6 +271,7 @@ def _error_page(db_path: str, message: str, details, status: int):
             "current_pending_month": None,
             "sealed_months": [],
             "batches": [],
+            "sorting_batches": [],
         }
     return (
         render_template(

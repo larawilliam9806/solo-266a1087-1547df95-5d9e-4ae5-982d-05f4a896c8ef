@@ -9,7 +9,14 @@ import re
 import unicodedata
 
 from .errors import ValidationError
-from .utils import format_kg, parse_grams, parse_month, parse_revision, InputError
+from .utils import (
+    format_kg,
+    parse_grams,
+    parse_int_grams,
+    parse_month,
+    parse_revision,
+    InputError,
+)
 
 MAX_ROWS = 50_000
 MAX_BYTES = 8 * 1024 * 1024
@@ -58,6 +65,42 @@ HEADER_ALIASES = {
 }
 
 REQUIRED = ("ticket_no", "collection_month", "street", "weight", "revision")
+
+# Headers used by the sorting (waste-category) CSV.
+SORTING_HEADER_ALIASES = {
+    "ticketno": "ticket_no",
+    "ticketnumber": "ticket_no",
+    "ticket": "ticket_no",
+    "单号": "ticket_no",
+    "磅单号": "ticket_no",
+    "票据号": "ticket_no",
+    "单据号": "ticket_no",
+    "流水号": "ticket_no",
+    "修订号": "revision",
+    "版本号": "revision",
+    "版本": "revision",
+    "修订": "revision",
+    "revision": "revision",
+    "rev": "revision",
+    "version": "revision",
+    "类别": "category",
+    "垃圾类别": "category",
+    "垃圾分类": "category",
+    "分类": "category",
+    "品类": "category",
+    "category": "category",
+    "克重": "grams",
+    "重量克": "grams",
+    "净重克": "grams",
+    "克数": "grams",
+    "grams": "grams",
+    "weightg": "grams",
+}
+
+SORTING_REQUIRED = ("ticket_no", "revision", "category", "grams")
+
+# The reserved bucket label belongs to the report, not to uploaded data.
+RESERVED_CATEGORY = "未分类"
 
 
 def _normalise_header(value: str) -> str:
@@ -196,6 +239,99 @@ def parse_upload(data: bytes, filename: str = "upload.csv") -> list[dict]:
     return rows
 
 
+def _clean_category(value: str) -> str:
+    text = re.sub(r"\s+", " ", _clean(value))
+    if not text:
+        raise InputError("类别不能为空")
+    if len(text) > 100:
+        raise InputError("类别名称过长")
+    if any(ord(ch) < 32 for ch in text):
+        raise InputError("类别名称含控制字符")
+    if text == RESERVED_CATEGORY:
+        raise InputError(f"“{RESERVED_CATEGORY}”是系统保留类别，不能在分拣资料中使用")
+    return text
+
+
+def parse_sorting(data: bytes, filename: str = "sorting.csv") -> list[dict]:
+    """Parse a sorting CSV: ticket no, booked revision, category, grams.
+
+    One row per (ticket, category).  Whole-file validation: any unparseable
+    row rejects the entire upload before the service layer runs.
+    """
+
+    text = _decode(data)
+    stream = io.StringIO(text, newline="")
+    reader = csv.reader(stream, delimiter=_sniff_delimiter(text[:8192]))
+    header: list[str] | None = None
+    columns: dict[str, int] = {}
+    rows: list[dict] = []
+    errors: list[dict] = []
+
+    for raw in reader:
+        line = reader.line_num
+        if header is None:
+            if not raw or all(not _clean(cell) for cell in raw):
+                continue
+            header = raw
+            normalised = [_normalise_header(cell) for cell in raw]
+            for index, key in enumerate(normalised):
+                field = SORTING_HEADER_ALIASES.get(key)
+                if field and field not in columns:
+                    columns[field] = index
+            missing = [name for name in SORTING_REQUIRED if name not in columns]
+            if missing:
+                labels = {
+                    "ticket_no": "单号",
+                    "revision": "修订号",
+                    "category": "类别",
+                    "grams": "克重（克）",
+                }
+                raise ValidationError(
+                    "分拣 CSV 表头缺少列：" + "、".join(labels[name] for name in missing)
+                    + "。需要的表头为：单号、修订号、类别、克重（克）"
+                )
+            continue
+
+        if not raw or all(not _clean(cell) for cell in raw):
+            continue
+        if len(rows) >= MAX_ROWS:
+            raise ValidationError(f"单批最多 {MAX_ROWS} 行，请拆分后上传")
+        if len(raw) > len(header) and any(_clean(cell) for cell in raw[len(header):]):
+            errors.append({"line": line, "message": "列数多于表头，无法确定归属列"})
+            continue
+
+        def cell(field: str) -> str:
+            index = columns[field]
+            return raw[index] if index < len(raw) else ""
+
+        try:
+            ticket_no = _clean_ticket(cell("ticket_no"))
+            revision = parse_revision(cell("revision"))
+            category = _clean_category(cell("category"))
+            grams = parse_int_grams(cell("grams"))
+        except InputError as exc:
+            errors.append({"line": line, "message": str(exc)})
+            continue
+
+        rows.append(
+            {
+                "line": line,
+                "ticket_no": ticket_no,
+                "revision": revision,
+                "category": category,
+                "grams": grams,
+            }
+        )
+
+    if header is None:
+        raise ValidationError("分拣 CSV 没有表头行")
+    if errors:
+        raise ValidationError("分拣 CSV 存在无法解析的行，整批退回", errors)
+    if not rows:
+        raise ValidationError("分拣 CSV 没有数据行")
+    return rows
+
+
 def rows_digest(rows: list[dict]) -> str:
     canonical = "\n".join(
         "\x1f".join(
@@ -209,7 +345,7 @@ def rows_digest(rows: list[dict]) -> str:
         )
         for row in rows
     )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical.encode("utf-8"))
 
 
 def snapshot_csv(payload: dict) -> bytes:

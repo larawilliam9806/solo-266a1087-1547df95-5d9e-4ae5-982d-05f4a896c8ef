@@ -106,6 +106,94 @@
     });
   }
 
+  var sortingForm = document.getElementById("sorting-form");
+  if (sortingForm) {
+    sortingForm.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var box = document.getElementById("sorting-result");
+      var button = sortingForm.querySelector('button[type="submit"]');
+      var fileInput = sortingForm.querySelector('input[type="file"]');
+      if (!fileInput.files.length) {
+        renderResult(box, { ok: false, error: "请选择要上传的分拣 CSV 文件" });
+        return;
+      }
+      var body = new FormData();
+      body.append("file", fileInput.files[0]);
+
+      button.disabled = true;
+      button.textContent = "校验中…";
+
+      fetch("/api/sorting", {
+        method: "POST",
+        body: body,
+        headers: { "X-CSRF-Token": csrfToken(), "Accept": "application/json" },
+      })
+        .then(function (response) {
+          return response.json().then(function (data) {
+            if (!response.ok) {
+              data.ok = false;
+              if (!data.error) data.error = "上传失败（HTTP " + response.status + "）";
+            }
+            return data;
+          });
+        })
+        .catch(function () {
+          return { ok: false, error: "网络中断，未确认本次上传是否生效，请刷新后核对分类" };
+        })
+        .then(function (data) {
+          button.disabled = false;
+          button.textContent = "上传并校验分拣资料";
+          renderSortingResult(box, data);
+          if (data.ok) {
+            fileInput.value = "";
+            window.setTimeout(function () {
+              window.location.reload();
+            }, 1200);
+          }
+        });
+    });
+  }
+
+  function renderSortingResult(box, data) {
+    box.hidden = false;
+    box.textContent = "";
+    box.className = "result " + (data.ok ? "ok" : "bad");
+
+    if (data.ok) {
+      var s = data.summary || {};
+      box.appendChild(
+        el(
+          "h3",
+          null,
+          "分拣资料已换交：覆盖 " + s.tickets + " 笔入账，共 " + s.rows + " 行"
+        )
+      );
+      box.appendChild(
+        el("p", "muted", "页面即将刷新，分类月表将按新分类核算。")
+      );
+      return;
+    }
+
+    box.appendChild(el("h3", null, data.error || "分拣资料未通过校验"));
+    var details = data.details || [];
+    if (details.length) {
+      var list = el("ul");
+      details.forEach(function (item) {
+        var text = "第 " + item.line + " 行";
+        if (item.ticket_no) text += "（" + item.ticket_no + "）";
+        text += "：" + item.message;
+        list.appendChild(el("li", null, text));
+      });
+      box.appendChild(list);
+    }
+    if (data.details_truncated) {
+      box.appendChild(
+        el("p", "muted", "仅显示前 " + details.length + " 条，共 " + data.detail_count + " 条。")
+      );
+    }
+    box.appendChild(el("p", "muted", "整批退回，未写入任何数据，原分类保持不变。"));
+  }
+
   document.querySelectorAll("[data-seal]").forEach(function (button) {
     button.addEventListener("click", function () {
       var month = button.getAttribute("data-seal");

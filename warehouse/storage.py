@@ -73,6 +73,34 @@ CREATE TABLE IF NOT EXISTS snapshots (
     total_grams            INTEGER NOT NULL,
     payload_json           TEXT NOT NULL
 );
+
+-- Sorting (waste-category) data arrives separately from the weighbridge
+-- tickets.  A batch replaces, wholesale, every category row of the ticket
+-- revisions it lists; revisions it does not mention keep their old splits.
+CREATE TABLE IF NOT EXISTS sorting_batches (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename     TEXT NOT NULL,
+    uploaded_at  TEXT NOT NULL,
+    ticket_count INTEGER NOT NULL,
+    row_count    INTEGER NOT NULL,
+    digest       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sorting_splits (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id   INTEGER NOT NULL REFERENCES sorting_batches(id),
+    ticket_no  TEXT NOT NULL,
+    revision   INTEGER NOT NULL CHECK (revision >= 1),
+    category   TEXT NOT NULL,
+    grams      INTEGER NOT NULL CHECK (grams >= 0),
+    created_at TEXT NOT NULL,
+    UNIQUE (ticket_no, revision, category)
+);
+
+CREATE INDEX IF NOT EXISTS idx_splits_ticket_rev
+    ON sorting_splits (ticket_no, revision);
+CREATE INDEX IF NOT EXISTS idx_splits_batch
+    ON sorting_splits (batch_id);
 """
 
 

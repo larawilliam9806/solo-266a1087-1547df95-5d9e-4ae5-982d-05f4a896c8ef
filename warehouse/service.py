@@ -24,13 +24,14 @@ Rules implemented here
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import os
 import re
 import sqlite3
 
-from .csvio import parse_upload
+from .csvio import RESERVED_CATEGORY, parse_sorting, parse_upload
 from .errors import (
     AlreadyInitializedError,
     BatchRejected,
@@ -40,7 +41,7 @@ from .errors import (
     ValidationError,
 )
 from .storage import read_tx, write_tx
-from .utils import InputError, next_month, now_iso, parse_month
+from .utils import InputError, month_range, next_month, now_iso, parse_month
 
 # ---------------------------------------------------------------- helpers
 
@@ -132,6 +133,17 @@ def _batch_dict(row: sqlite3.Row) -> dict:
     }
 
 
+def _sorting_batch_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "filename": row["filename"],
+        "uploaded_at": row["uploaded_at"],
+        "ticket_count": row["ticket_count"],
+        "row_count": row["row_count"],
+        "digest": row["digest"],
+    }
+
+
 # ------------------------------------------------------------ state / init
 
 
@@ -145,6 +157,7 @@ def state_view(db_path: str) -> dict:
                 "current_pending_month": None,
                 "sealed_months": [],
                 "batches": [],
+                "sorting_batches": [],
             }
         sealed = [
             {
@@ -161,6 +174,12 @@ def state_view(db_path: str) -> dict:
                 "SELECT * FROM batches ORDER BY id DESC LIMIT 20"
             ).fetchall()
         ]
+        sorting_batches = [
+            _sorting_batch_dict(row)
+            for row in conn.execute(
+                "SELECT * FROM sorting_batches ORDER BY id DESC LIMIT 20"
+            ).fetchall()
+        ]
         return {
             "initialized": True,
             "first_pending_month": state["first_pending_month"],
@@ -169,6 +188,7 @@ def state_view(db_path: str) -> dict:
             "updated_at": state["updated_at"],
             "sealed_months": sealed,
             "batches": batches,
+            "sorting_batches": sorting_batches,
         }
 
 
@@ -597,3 +617,433 @@ def recent_batches(db_path: str, limit: int = 20) -> list[dict]:
                 "SELECT * FROM batches ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         ]
+
+
+# ============================================================== sorting
+
+
+def _booked_revisions(conn: sqlite3.Connection, ticket_no: str) -> list[tuple[int, int]]:
+    """Distinct ``(revision, grams)`` versions actually booked for a ticket.
+
+    Only ``book`` rows define a revision with a full net weight.  A no-op
+    revision bump writes no booking, so it never appears here and cannot be
+    referenced by sorting data.
+    """
+
+    rows = conn.execute(
+        """
+        SELECT revision, grams
+          FROM bookings
+         WHERE ticket_no = ? AND kind = 'book'
+         GROUP BY revision
+         ORDER BY revision
+        """,
+        (ticket_no,),
+    ).fetchall()
+    return [(int(row["revision"]), int(row["grams"])) for row in rows]
+
+
+def _effective_revision(booked: list[int], revision: int) -> int:
+    """Resolve which booked revision a booking inherits its split from.
+
+    A reversal points at the revision it supersedes; when that revision was a
+    no-op bump (no booking of its own) we fall back to the latest revision
+    that was actually booked.  ``booked`` is the sorted booked-revision list.
+    """
+
+    index = bisect.bisect_right(booked, revision) - 1
+    if index < 0:
+        return revision
+    return booked[index]
+
+
+def upload_sorting(
+    db_path: str,
+    filename: str,
+    data: bytes,
+) -> dict:
+    """Validate and apply one sorting (category) CSV.
+
+    The batch wholesale replaces the splits of the ticket revisions it
+    lists.  Any validation failure rolls the whole transaction back, so the
+    previously stored categories remain exactly as they were.
+    """
+
+    with read_tx(db_path) as conn:
+        _require_state(conn)
+
+    rows = parse_sorting(data, filename)
+    digest = hashlib.sha256(data).hexdigest()
+    stamp = now_iso()
+
+    with write_tx(db_path) as conn:
+        _require_state(conn)
+
+        # 1. Within-file duplicates: one row per (ticket, revision, category).
+        seen: dict[tuple[str, int, str], int] = {}
+        duplicates: list[dict] = []
+        for row in rows:
+            key3 = (row["ticket_no"], row["revision"], row["category"])
+            if key3 in seen:
+                duplicates.append(
+                    {
+                        "line": row["line"],
+                        "ticket_no": row["ticket_no"],
+                        "message": (
+                            f"单号 {row['ticket_no']} 修订号 {row['revision']} 的类别 "
+                            f"{row['category']} 在同一批次中重复"
+                            f"（首次出现在第 {seen[key3]} 行）"
+                        ),
+                    }
+                )
+            else:
+                seen[key3] = row["line"]
+        if duplicates:
+            raise BatchRejected("分拣批次内存在重复行，整批退回", duplicates)
+
+        ticket_numbers = list({row["ticket_no"] for row in rows})
+        existing_tickets = {
+            record["ticket_no"]: record
+            for chunk_start in range(0, len(ticket_numbers), 500)
+            for record in conn.execute(
+                f"SELECT * FROM tickets WHERE ticket_no IN "
+                f"({','.join('?' for _ in ticket_numbers[chunk_start:chunk_start + 500])})",
+                ticket_numbers[chunk_start:chunk_start + 500],
+            )
+        }
+
+        # Aggregate the file per (ticket, revision) for the net checks.
+        grouped: dict[tuple[str, int], dict] = {}
+        for row in rows:
+            entry = grouped.setdefault(
+                (row["ticket_no"], row["revision"]),
+                {"grams": 0, "categories": [], "line": row["line"]},
+            )
+            entry["grams"] += row["grams"]
+            entry["categories"].append((row["category"], row["grams"], row["line"]))
+
+        errors: list[dict] = []
+        planned: list[dict] = []
+        for (ticket_no, revision), entry in sorted(grouped.items()):
+            record = existing_tickets.get(ticket_no)
+            if record is None:
+                errors.append(
+                    {
+                        "line": entry["line"],
+                        "ticket_no": ticket_no,
+                        "message": (
+                            f"单号 {ticket_no} 尚无地磅入账，不能提交分拣资料"
+                        ),
+                    }
+                )
+                continue
+            if revision > int(record["current_revision"]):
+                errors.append(
+                    {
+                        "line": entry["line"],
+                        "ticket_no": ticket_no,
+                        "message": (
+                            f"单号 {ticket_no} 的修订号 {revision} 尚未入账"
+                            f"（当前修订号 {record['current_revision']}）"
+                        ),
+                    }
+                )
+                continue
+
+            booked = _booked_revisions(conn, ticket_no)
+            booked_revisions = [item[0] for item in booked]
+            if revision not in booked_revisions:
+                errors.append(
+                    {
+                        "line": entry["line"],
+                        "ticket_no": ticket_no,
+                        "message": (
+                            f"单号 {ticket_no} 的修订号 {revision} 没有对应入账"
+                            "（仅推进修订号的版本不记账），请填写实际入账的修订号"
+                        ),
+                    }
+                )
+                continue
+            net_grams = dict(booked)[revision]
+            if entry["grams"] != net_grams:
+                errors.append(
+                    {
+                        "line": entry["line"],
+                        "ticket_no": ticket_no,
+                        "message": (
+                            f"单号 {ticket_no} 修订号 {revision} 的各类克重之和 "
+                            f"{entry['grams']} 克不等于该笔入账净重 {net_grams} 克"
+                        ),
+                    }
+                )
+                continue
+            planned.append(
+                {
+                    "ticket_no": ticket_no,
+                    "revision": revision,
+                    "net_grams": net_grams,
+                    "categories": entry["categories"],
+                }
+            )
+
+        if errors:
+            raise BatchRejected("分拣资料校验未通过，整批退回，原分类保持不变", errors)
+
+        batch_cursor = conn.execute(
+            """
+            INSERT INTO sorting_batches (filename, uploaded_at, ticket_count,
+                                         row_count, digest)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (_safe_filename(filename), stamp, len(planned), len(rows), digest),
+        )
+        batch_id = int(batch_cursor.lastrowid)
+
+        # Wholesale replacement for every listed (ticket, revision): delete
+        # the old splits first, then insert the new ones, in this one
+        # transaction, so a failure always leaves the original categories in
+        # place.
+        for item in planned:
+            conn.execute(
+                "DELETE FROM sorting_splits WHERE ticket_no = ? AND revision = ?",
+                (item["ticket_no"], item["revision"]),
+            )
+            for category, grams, _line in item["categories"]:
+                conn.execute(
+                    """
+                    INSERT INTO sorting_splits (batch_id, ticket_no, revision,
+                                                category, grams, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        batch_id,
+                        item["ticket_no"],
+                        item["revision"],
+                        category,
+                        grams,
+                        stamp,
+                    ),
+                )
+
+        batch = _sorting_batch_dict(
+            conn.execute(
+                "SELECT * FROM sorting_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+        )
+
+    return {
+        "batch": batch,
+        "summary": {
+            "rows": len(rows),
+            "tickets": len(planned),
+        },
+    }
+
+
+def classification_view(db_path: str, start: object, end: object) -> dict:
+    """Build the category monthly table for an inclusive month range.
+
+    Every read happens in one read transaction, so the whole query is
+    answered from a single consistent snapshot of both the ledger and the
+    sorting data: uploads, seals and sorting exchanges committed meanwhile do
+    not change the answer.
+    """
+
+    try:
+        start_month = parse_month(start)
+        end_month = parse_month(end)
+    except InputError as exc:
+        raise ValidationError(str(exc)) from None
+    if start_month > end_month:
+        raise ValidationError(
+            f"起始月份 {start_month} 不能晚于截止月份 {end_month}"
+        )
+
+    with read_tx(db_path) as conn:
+        state = _require_state(conn)
+        pending = state["current_pending_month"]
+        if end_month > pending:
+            raise ConflictError(
+                f"截止月份 {end_month} 尚未开启；当前待封月为 {pending}"
+            )
+
+        months = month_range(start_month, end_month)
+        if len(months) > 240:
+            raise ValidationError("一次查询最多覆盖 240 个月，请缩小月份范围")
+
+        bookings = conn.execute(
+            """
+            SELECT * FROM bookings
+             WHERE target_month BETWEEN ? AND ?
+             ORDER BY id
+            """,
+            (start_month, end_month),
+        ).fetchall()
+        split_rows = conn.execute(
+            "SELECT ticket_no, revision, category, grams FROM sorting_splits"
+        ).fetchall()
+
+        # The booked history of every ticket touched by the range is needed
+        # to resolve no-op revision bumps, even when the original booking is
+        # itself outside the queried months.
+        touched = list({booking["ticket_no"] for booking in bookings})
+        booked_by_ticket: dict[str, list[tuple[int, int]]] = {}
+        for chunk_start in range(0, len(touched), 500):
+            chunk = touched[chunk_start : chunk_start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            for record in conn.execute(
+                f"""
+                SELECT ticket_no, revision, grams
+                  FROM bookings
+                 WHERE kind = 'book' AND ticket_no IN ({placeholders})
+                 ORDER BY ticket_no, revision
+                """,
+                chunk,
+            ):
+                booked_by_ticket.setdefault(
+                    record["ticket_no"], []
+                ).append((int(record["revision"]), int(record["grams"])))
+
+        # All data needed below is now in hand from this one snapshot.
+        bookings = [dict(booking) for booking in bookings]
+        split_snapshot = [dict(row) for row in split_rows]
+        booked_snapshot = {
+            ticket: list(entries) for ticket, entries in booked_by_ticket.items()
+        }
+
+    # Split lookup: (ticket, booked revision) -> {category: grams}.
+    splits: dict[tuple[str, int], dict[str, int]] = {}
+    for row in split_snapshot:
+        splits.setdefault(
+            (row["ticket_no"], int(row["revision"])), {}
+        )[row["category"]] = int(row["grams"])
+
+    def _add(
+        bucket: dict[str, dict[str, int]],
+        category: str,
+        column: str,
+        grams: int,
+    ) -> None:
+        categories = bucket.setdefault(
+            category, {"current": 0, "adjustment": 0}
+        )
+        categories[column] += grams
+
+    month_views: list[dict] = []
+    # Pending list data: (ticket, effective revision) -> info.  Built from
+    # every booking in range whose effective split is missing, so an
+    # out-of-range original booking reversed inside the range is still
+    # flagged as needing sorting data.
+    pending_map: dict[tuple[str, int], dict] = {}
+
+    for month in months:
+        bucket: dict[str, dict[str, int]] = {}
+        bottom_current = 0
+        bottom_adjustment = 0
+        for booking in bookings:
+            if booking["target_month"] != month:
+                continue
+            grams = int(booking["grams"])
+            column = (
+                "current"
+                if booking["collection_month"] == month
+                else "adjustment"
+            )
+            if column == "current":
+                bottom_current += grams
+            else:
+                bottom_adjustment += grams
+
+            booked_entries = booked_snapshot.get(booking["ticket_no"], [])
+            booked_revisions = [revision for revision, _g in booked_entries]
+            effective = _effective_revision(
+                booked_revisions, int(booking["revision"])
+            )
+            split = splits.get((booking["ticket_no"], effective))
+            if split is None:
+                # A zero-weight booking has nothing to categorise: it neither
+                # adds an uncategorized row nor appears on the pending list.
+                if grams != 0:
+                    _add(bucket, RESERVED_CATEGORY, column, grams)
+                    # ``effective`` always resolves to a revision that has a
+                    # booking of its own, so its booked net weight is known.
+                    net_grams = dict(booked_entries)[effective]
+                    if net_grams > 0:
+                        pending_map.setdefault(
+                            (booking["ticket_no"], effective),
+                            {
+                                "ticket_no": booking["ticket_no"],
+                                "revision": effective,
+                                "net_grams": net_grams,
+                                "collection_month": booking["collection_month"],
+                            },
+                        )
+            else:
+                for category, split_grams in split.items():
+                    signed = split_grams if grams >= 0 else -split_grams
+                    _add(bucket, category, column, signed)
+
+        categories = []
+        uncategorized = bucket.pop(RESERVED_CATEGORY, None)
+        for category in sorted(bucket):
+            values = bucket[category]
+            categories.append(
+                {
+                    "category": category,
+                    "current_grams": values["current"],
+                    "adjustment_grams": values["adjustment"],
+                    "total_grams": values["current"] + values["adjustment"],
+                }
+            )
+        if uncategorized is not None:
+            categories.append(
+                {
+                    "category": RESERVED_CATEGORY,
+                    "current_grams": uncategorized["current"],
+                    "adjustment_grams": uncategorized["adjustment"],
+                    "total_grams": uncategorized["current"]
+                    + uncategorized["adjustment"],
+                    "reserved": True,
+                }
+            )
+
+        totals = {
+            "current_grams": sum(item["current_grams"] for item in categories),
+            "adjustment_grams": sum(
+                item["adjustment_grams"] for item in categories
+            ),
+            "total_grams": sum(item["total_grams"] for item in categories),
+        }
+        bottom_total = bottom_current + bottom_adjustment
+        month_views.append(
+            {
+                "month": month,
+                "categories": categories,
+                "totals": totals,
+                "bottom_totals": {
+                    "current_grams": bottom_current,
+                    "adjustment_grams": bottom_adjustment,
+                    "total_grams": bottom_total,
+                },
+                "matches_bottom": totals["current_grams"] == bottom_current
+                and totals["adjustment_grams"] == bottom_adjustment
+                and totals["total_grams"] == bottom_total,
+            }
+        )
+
+    pending_list = sorted(
+        pending_map.values(),
+        key=lambda item: (
+            item["collection_month"],
+            item["ticket_no"],
+            item["revision"],
+        ),
+    )
+    return {
+        "start_month": start_month,
+        "end_month": end_month,
+        "generated_at": now_iso(),
+        "months": month_views,
+        "pending": pending_list,
+        "pending_count": len(pending_list),
+    }

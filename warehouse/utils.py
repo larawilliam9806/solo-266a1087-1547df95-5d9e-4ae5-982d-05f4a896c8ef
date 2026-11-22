@@ -99,6 +99,42 @@ def parse_revision(value: object) -> int:
     return revision
 
 
+def parse_int_grams(value: object) -> int:
+    """Parse a sorting weight given directly in integer grams.
+
+    Sorting slips are recorded in whole grams; decimals, unit suffixes and
+    negative values are rejected instead of being silently rounded.
+    """
+
+    raw = str(value or "").strip()
+    if not raw:
+        raise InputError("克重不能为空")
+    text = raw.replace("，", ",").replace(" ", "")
+    if not re.fullmatch(r"[0-9]+", text):
+        raise InputError(f"克重必须是非负整数（克）：{raw}")
+    grams = int(text)
+    if grams > 10_000_000_000_000:
+        raise InputError(f"克重超出允许范围：{raw}")
+    return grams
+
+
+def month_range(start: str, end: str) -> list[str]:
+    """Every calendar month from ``start`` through ``end`` inclusive."""
+
+    start_year, start_mon = (int(part) for part in start.split("-"))
+    end_year, end_mon = (int(part) for part in end.split("-"))
+    months: list[str] = []
+    year, month = start_year, start_mon
+    while (year, month) <= (end_year, end_mon):
+        months.append(f"{year:04d}-{month:02d}")
+        if month == 12:
+            year += 1
+            month = 1
+        else:
+            month += 1
+    return months
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 

@@ -105,6 +105,12 @@
     {% else %}
     <p class="empty small">还没有封存的月份。</p>
     {% endif %}
+
+    <h2 class="spaced">分拣资料</h2>
+    <p class="empty small">
+      分拣单可晚于地磅单到仓。换交按单号与修订号整份替换分类，缺资料的重量计入「未分类」。
+    </p>
+    <a class="btn" href="{{ url_for('classify') }}">上传分拣资料 / 查看分类月表</a>
   </aside>
 </section>
 
